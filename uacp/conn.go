@@ -175,8 +175,19 @@ func (l *Listener) Endpoint() string {
 
 type Conn struct {
 	*net.TCPConn
-	id  uint32
+	id uint32
+
+	// ack holds the limits this side of the connection uses. For a client
+	// connection it starts as the requested ClientACK and is replaced by the
+	// negotiated values after the HEL/ACK handshake: ReceiveBufSize,
+	// MaxMessageSize and MaxChunkCount are the limits applied to data we
+	// receive and SendBufSize is the maximum chunk size we send.
 	ack *Acknowledge
+
+	// sendMaxMessageSize and sendMaxChunkCount are the limits the peer
+	// imposes on messages we send. Zero means no limit is known.
+	sendMaxMessageSize uint32
+	sendMaxChunkCount  uint32
 
 	closeOnce sync.Once
 }
@@ -209,6 +220,72 @@ func (c *Conn) MaxMessageSize() uint32 {
 
 func (c *Conn) MaxChunkCount() uint32 {
 	return c.ack.MaxChunkCount
+}
+
+// SendMaxMessageSize returns the maximum size of a message this side may
+// send, as limited by both sides of the connection. Zero means no limit.
+func (c *Conn) SendMaxMessageSize() uint32 {
+	return c.sendMaxMessageSize
+}
+
+// SendMaxChunkCount returns the maximum number of chunks of a message this
+// side may send, as limited by both sides of the connection. Zero means no
+// limit.
+func (c *Conn) SendMaxChunkCount() uint32 {
+	return c.sendMaxChunkCount
+}
+
+// MinBufSize is the minimum ReceiveBufferSize and SendBufferSize a peer
+// may announce (OPC UA Part 6, 7.1.2.3 and 7.1.2.4).
+const MinBufSize = 8192
+
+// negotiate sets the connection limits of a client from the HEL it sent and
+// the ACK the server returned, following OPC UA Part 6, 7.1.2.4.
+//
+// The values announced by the server are never trusted to size our own
+// buffers: the receive buffer is at most what we announced in the HEL and
+// the receive limits for messages and chunks are our own.
+func (c *Conn) negotiate(hel *Hello, ack *Acknowledge) error {
+	if ack.ReceiveBufSize < MinBufSize {
+		return errors.Errorf("uacp: invalid ACK: ReceiveBufSize %d < %d", ack.ReceiveBufSize, MinBufSize)
+	}
+	if ack.SendBufSize < MinBufSize {
+		return errors.Errorf("uacp: invalid ACK: SendBufSize %d < %d", ack.SendBufSize, MinBufSize)
+	}
+
+	maxMsg := hel.MaxMessageSize
+	if maxMsg == 0 {
+		maxMsg = DefaultMaxMessageSize
+	}
+	maxChunks := hel.MaxChunkCount
+	if maxChunks == 0 {
+		maxChunks = DefaultMaxChunkCount
+	}
+
+	c.ack = &Acknowledge{
+		Version: ack.Version,
+		// The server's SendBufferSize may only lower our receive buffer.
+		ReceiveBufSize: min(hel.ReceiveBufSize, ack.SendBufSize),
+		// Our chunks must fit into the server's receive buffer.
+		SendBufSize:    min(hel.SendBufSize, ack.ReceiveBufSize),
+		MaxMessageSize: maxMsg,
+		MaxChunkCount:  maxChunks,
+	}
+	c.sendMaxMessageSize = minNonZero(maxMsg, ack.MaxMessageSize)
+	c.sendMaxChunkCount = minNonZero(maxChunks, ack.MaxChunkCount)
+	return nil
+}
+
+// minNonZero returns the smaller of a and b where zero means "no limit".
+func minNonZero(a, b uint32) uint32 {
+	switch {
+	case a == 0:
+		return b
+	case b == 0:
+		return a
+	default:
+		return min(a, b)
+	}
 }
 
 func (c *Conn) Close() (err error) {
@@ -259,16 +336,14 @@ func (c *Conn) Handshake(ctx context.Context, endpoint string) error {
 		if ack.Version != 0 {
 			return errors.Errorf("uacp: invalid version %d", ack.Version)
 		}
-		if ack.MaxChunkCount == 0 {
-			ack.MaxChunkCount = DefaultMaxChunkCount
-			debug.Printf("uacp %d: server has no chunk limit. Using %d", c.id, ack.MaxChunkCount)
-		}
-		if ack.MaxMessageSize == 0 {
-			ack.MaxMessageSize = DefaultMaxMessageSize
-			debug.Printf("uacp %d: server has no message size limit. Using %d", c.id, ack.MaxMessageSize)
-		}
-		c.ack = ack
 		debug.Printf("uacp %d: recv %#v", c.id, ack)
+		if err := c.negotiate(hel, ack); err != nil {
+			c.SendError(ua.StatusBadTCPInternalError)
+			return err
+		}
+		debug.Printf("uacp %d: negotiated recv=%d send=%d maxMsg=%d maxChunks=%d sendMaxMsg=%d sendMaxChunks=%d",
+			c.id, c.ack.ReceiveBufSize, c.ack.SendBufSize, c.ack.MaxMessageSize, c.ack.MaxChunkCount,
+			c.sendMaxMessageSize, c.sendMaxChunkCount)
 		return nil
 
 	case "ERRF":
